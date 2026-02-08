@@ -1,0 +1,431 @@
+import cairo
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Pango', '1.0')
+gi.require_version('PangoCairo', '1.0')
+from gi.repository import Gtk, Gdk, Pango, PangoCairo
+
+from pdf_app.document.render import render_page_to_surface
+
+class PDFDrawingArea(Gtk.DrawingArea):
+    """
+    Handles only the background drawing: PDF + Highlights + Underlines.
+    Does NOT handle text widgets or overlay interactions.
+    """
+    def __init__(self, page, scale, store):
+        super().__init__()
+        self.page = page
+        self.scale = scale
+        self.store = store
+        self.surface = None
+        
+        self.set_focusable(True) # Allow focus to be grabbed
+        self.set_can_target(True) # Allow events (focus)
+        self.set_draw_func(self.on_draw)
+        
+        # Selection State
+        self.selection_start = None
+        self.selection_end = None
+        self.selected_region = None
+        
+        self.selected_annotation = None # For Highlights/Underlines
+        
+        # Handle Resize State
+        self._resizing_handle = None  # 'start' or 'end' when dragging
+        self._resize_start_pos = None  # Initial drag position
+        self.handle_radius = 12  # Larger radius for easier clicking
+        self._old_rects = None  # Store original rects for undo
+        
+        # Click Gesture REMOVED - Managed by Parent (PDFPageView)
+        # click = Gtk.GestureClick()
+        # click.connect("pressed", self.on_click)
+        # self.add_controller(click)
+        
+        # Drag Gesture REMOVED - Managed by Parent (PDFPageView) due to Z-order issues
+        
+        self.queue_draw()
+        
+    def update_scale(self, scale):
+        self.scale = scale
+        self.surface = None
+        self.queue_draw()
+
+    # def on_click(self, gesture, n_press, x, y):
+        #     # REMOVED: Handled by PDFPageView
+        #     pass
+
+    def get_handle_positions(self):
+        """Returns (start_handle, end_handle) as (x, y) tuples in widget coords."""
+        ann = self.selected_annotation
+        if not ann or not ann.rects:
+            return None, None
+            
+        if ann.type == 'text':
+            return None, None
+        
+        first_rect = ann.rects[0]
+        last_rect = ann.rects[-1]
+        
+        # Start handle: Top-left of first rect (with offset for circle)
+        start_x = first_rect[0] * self.scale
+        start_y = first_rect[1] * self.scale - self.handle_radius
+        
+        # End handle: Bottom-right of last rect (with offset)
+        end_x = (last_rect[0] + last_rect[2]) * self.scale
+        end_y = (last_rect[1] + last_rect[3]) * self.scale + self.handle_radius
+        
+        return (start_x, start_y), (end_x, end_y)
+
+    def is_point_on_handle(self, x, y):
+        """Check if point is on start/end handle."""
+        start, end = self.get_handle_positions()
+        if not start:
+            return False
+            
+        threshold = self.handle_radius * 2
+        dist_start = ((x - start[0])**2 + (y - start[1])**2)**0.5
+        dist_end = ((x - end[0])**2 + (y - end[1])**2)**0.5
+        
+        return dist_start < threshold or dist_end < threshold
+
+    def handle_drag_begin(self, start_x, start_y):
+        """Called by parent when drag starts on a handle."""
+        print(f"DEBUG: PDFDrawingArea handle_drag_begin at ({start_x}, {start_y})")
+        if not self.selected_annotation:
+            return False
+        
+        ann = self.selected_annotation
+        start_handle, end_handle = self.get_handle_positions()
+        threshold = self.handle_radius * 2
+
+        # Check interaction with HANDLES
+        if start_handle:
+            dist_start = ((start_x - start_handle[0])**2 + (start_y - start_handle[1])**2)**0.5
+            dist_end = ((start_x - end_handle[0])**2 + (start_y - end_handle[1])**2)**0.5
+            
+            if dist_start < threshold:
+                self._resizing_handle = 'start'
+                self._resize_start_pos = (start_x, start_y)
+                self._old_rects = list(self.selected_annotation.rects) if self.selected_annotation.rects else []
+                if self.selected_annotation.rects:
+                    last_r = self.selected_annotation.rects[-1]
+                    self._anchor_pdf = (last_r[0] + last_r[2], last_r[1] + last_r[3])
+                cursor = Gdk.Cursor.new_from_name("w-resize", None)
+                self.set_cursor(cursor)
+                print(f"DEBUG: Started resizing START handle, anchor at {self._anchor_pdf}")
+                return True
+    
+            elif dist_end < threshold:
+                self._resizing_handle = 'end'
+                self._resize_start_pos = (start_x, start_y)
+                self._old_rects = list(self.selected_annotation.rects) if self.selected_annotation.rects else []
+                if self.selected_annotation.rects:
+                    first_r = self.selected_annotation.rects[0]
+                    self._anchor_pdf = (first_r[0], first_r[1])
+                cursor = Gdk.Cursor.new_from_name("e-resize", None)
+                self.set_cursor(cursor)
+                print(f"DEBUG: Started resizing END handle, anchor at {self._anchor_pdf}")
+                return True
+            
+        # Check for MOVE (drag body) - Valid for ALL annotation types
+        # ... logic continues below ...
+            
+        # Check for MOVE (drag body)
+        pdf_x = start_x / self.scale
+        pdf_y = start_y / self.scale
+        # Check if point inside any rect
+        for r in ann.rects:
+            # r is (x, y, w, h)
+            if r[0] <= pdf_x <= r[0] + r[2] and r[1] <= pdf_y <= r[1] + r[3]:
+                self._resizing_handle = 'move'
+                self._resize_start_pos = (start_x, start_y)
+                self._old_rects = list(ann.rects) if ann.rects else []
+                cursor = Gdk.Cursor.new_from_name("move", None)
+                self.set_cursor(cursor)
+                print(f"DEBUG: Started MOVING annotation {ann.id}")
+                return True
+                
+        return False
+            
+    def handle_drag_update(self, offset_x, offset_y):
+        """Update highlight during resize drag using Poppler text selection."""
+        if not self._resizing_handle or not self.selected_annotation:
+            return
+        
+        # Current cursor position in widget coords
+        start_x, start_y = self._resize_start_pos
+        cur_x = start_x + offset_x
+        cur_y = start_y + offset_y
+        
+        # Convert to PDF coords
+        pdf_x = cur_x / self.scale
+        pdf_y = cur_y / self.scale
+        
+        # HANDLE MOVE
+        if self._resizing_handle == 'move':
+            # Calculate delta in pdf coords
+            dx = offset_x / self.scale
+            dy = offset_y / self.scale
+            
+            new_rects = []
+            for r in self._old_rects:
+                new_rects.append((r[0] + dx, r[1] + dy, r[2], r[3]))
+            
+            self.selected_annotation.rects = new_rects
+            self.queue_draw()
+            return
+
+        anchor_x, anchor_y = self._anchor_pdf
+        
+        # Create selection rectangle from anchor to cursor
+        import gi
+        gi.require_version('Poppler', '0.18')
+        from gi.repository import Poppler
+        
+        rect = Poppler.Rectangle()
+        # Always ensure x1 < x2 and y1 < y2
+        rect.x1 = min(pdf_x, anchor_x)
+        rect.y1 = min(pdf_y, anchor_y)
+        rect.x2 = max(pdf_x, anchor_x)
+        rect.y2 = max(pdf_y, anchor_y)
+        
+        print(f"DEBUG: Selection rect: ({rect.x1:.1f}, {rect.y1:.1f}) to ({rect.x2:.1f}, {rect.y2:.1f})")
+        
+        # Get text selection region from Poppler
+        try:
+            region = self.page.get_selected_region(
+                1.0, Poppler.SelectionStyle.GLYPH, rect
+            )
+            
+            # Convert region to rects for annotation
+            if region and region.num_rectangles() > 0:
+                new_rects = []
+                for i in range(region.num_rectangles()):
+                    r = region.get_rectangle(i)
+                    # cairo.RectangleInt uses x, y, width, height
+                    new_rects.append((
+                        r.x, r.y, r.width, r.height
+                    ))
+                self.selected_annotation.rects = new_rects
+                print(f"DEBUG: Updated to {len(new_rects)} rects")
+            else:
+                print("DEBUG: No text in selection region")
+        except Exception as e:
+            print(f"DEBUG: Selection error: {e}")
+        
+        self.queue_draw()
+
+    def handle_drag_end(self, offset_x, offset_y):
+        """Finalize resize and save."""
+        if self._resizing_handle and self.selected_annotation and self._old_rects:
+            print(f"DEBUG: Finished resizing {self._resizing_handle} handle")
+            # Record the modification for undo (stores old rects)
+            self.store.record_modify(self.selected_annotation.id, self._old_rects)
+            self.store.save()
+            
+        self._resizing_handle = None
+        self._resize_start_pos = None
+        self._anchor_pdf = None
+        self._old_rects = None
+        # Reset cursor to default
+        self.set_cursor(None)
+
+    def on_draw(self, area, c, width, height):
+        # 1. Render Surface (PDF + Background)
+        if self.surface is None:
+            self.surface = render_page_to_surface(self.page, self.scale)
+        
+        c.set_source_surface(self.surface, 0, 0)
+        c.paint()
+        
+        # 2. Draw Highlights/Underlines
+        # (These remain "painted" on, for now - they are in the surface if we re-render?
+        # NO, render_page_to_surface only renders the PDF. 
+        # We need to draw the annotations on top if they are not part of the PDF surface yet.)
+        # WAIT: render_page_to_surface (impl) usually renders PDF.
+        # Store attributes should be drawn here.
+        
+        if self.store:
+            # annotations = self.store.get_for_page(self.page.get_index())
+            # Actually, let's assume get_for_page needs page number
+            # Does self.page have .get_index()? usually it's passed in init.
+            # PageView passed `self.page` and `self.page_number`.
+            # DrawingArea has `self.page`. Poppler page has index?
+            # Let's use self.store.get_for_page(self.page.get_index())
+            try:
+                page_idx = self.page.get_index()
+            except:
+                page_idx = 0 # Fallback
+                
+            annotations = self.store.get_for_page(page_idx)
+            
+            c.save()
+            c.scale(self.scale, self.scale) 
+            
+            for ann in annotations:
+                r, g, b, a = ann.color
+                c.set_source_rgba(r, g, b, a)
+                
+                if ann.type == 'highlight':
+                    for rect in ann.rects:
+                        x, y, w, h = rect
+                        c.rectangle(x, y, w, h)
+                        c.fill()
+                        
+                elif ann.type == 'underline':
+                    c.set_line_width(1.0)
+                    for rect in ann.rects:
+                        x, y, w, h = rect
+                        c.move_to(x, y + h)
+                        c.line_to(x + w, y + h)
+                        c.stroke()
+                
+                elif ann.type == 'text':
+                    self.draw_text_annotation(c, ann)
+    
+            c.restore()
+
+        # 3. Draw Selection Overlay (Text Selection)
+        if self.selected_region:
+            c.set_source_rgba(0.0, 0.4, 0.8, 0.4) # Blue, semi-transparent
+            
+            region = self.selected_region
+            num_rects = region.num_rectangles()
+            
+            for i in range(num_rects):
+                rect = region.get_rectangle(i)
+                # Region rects are already in widget coordinates (if created with scale)
+                c.rectangle(rect.x, rect.y, rect.width, rect.height)
+                
+            c.fill()
+
+        # 4. Draw Annotation Selection (Active)
+        if self.selected_annotation:
+            self.draw_annotation_selection(c, self.selected_annotation)
+
+    def draw_text_annotation(self, c, ann):
+        if not ann.rects:
+            return
+            
+        x, y, w, h = ann.rects[0]
+        
+        # Create Layout
+        layout = PangoCairo.create_layout(c)
+        layout.set_text(ann.content, -1)
+        
+        # Font Style (Naive parsing for now)
+        font_desc = Pango.FontDescription("Sans 12")
+        # Scale handling: font size 12 matches 12 points in PDF if scale is handled by cairo
+        layout.set_font_description(font_desc)
+        
+        # Position
+        c.move_to(x, y)
+        
+        # Draw
+        PangoCairo.show_layout(c, layout)
+        
+        # Update rect size if needed (e.g. 0x0 or changed)
+        # Get logical size in Pango units
+        _ink, logical = layout.get_extents()
+        # Convert to PDF units (unscale)
+        # Note: 'logical' is in Pango units (1/1024), convert to pixels then unscale?
+        # PangoCairo context is scaled. Pango units -> Screen Pixels.
+        # Screen Pixels / self.scale -> PDF units.
+        
+        pixel_w = logical.width / Pango.SCALE
+        pixel_h = logical.height / Pango.SCALE
+        
+        current_w = w
+        current_h = h
+        
+        # Check if size needs update in store (e.g. if it was 0 or content changed)
+        # Tolerance for float comparison
+        if abs(pixel_w - current_w) > 1.0 or abs(pixel_h - current_h) > 1.0:
+            # Update rects
+            # Note: This modifies the annotation in memory. 
+            # We don't save to disk on every draw to avoid heavy IO.
+            # But it ensures hit-testing uses the visual size.
+            ann.rects[0] = (x, y, pixel_w, pixel_h)
+
+    def draw_annotation_selection(self, c, ann):
+        """Draw handles for selected annotation."""
+        # Draw Start and End Handles for the annotation
+        if not ann.rects:
+            return
+
+        if ann.type == 'text':
+            # Draw Bounding Box only
+            c.save()
+            c.set_line_width(1.0)
+            c.set_dash([4.0, 4.0], 0) # Dashed line
+            c.set_source_rgba(0.2, 0.6, 1.0, 0.8) # Blue
+            
+            for r in ann.rects:
+                x, y, w, h = r
+                # Convert to widget coords
+                wx = x * self.scale
+                wy = y * self.scale
+                ww = w * self.scale
+                wh = h * self.scale
+                c.rectangle(wx, wy, ww, wh)
+                c.stroke()
+            c.restore()
+            return
+
+        # print(f"DEBUG: Drawing handles for {ann.id}")
+        
+        start_handle, end_handle = self.get_handle_positions()
+        
+        # We want to identify the "Start" (Top-Left of first rect) 
+        # and "End" (Bottom-Right of last rect)
+        
+        first_rect = ann.rects[0]
+        last_rect = ann.rects[-1]
+        
+        # Start Handle: Top-Left of First Rect
+        x1 = first_rect[0] * self.scale
+        y1 = first_rect[1] * self.scale
+        h1 = first_rect[3] * self.scale
+        
+        # End Handle: Bottom-Right of Last Rect
+        x2 = (last_rect[0] + last_rect[2]) * self.scale
+        y2 = (last_rect[1] + last_rect[3]) * self.scale
+        h2 = last_rect[3] * self.scale
+        
+        handle_radius = 10  # Larger for easier clicking
+        
+        # Draw Handles with white outline for visibility
+        # Start Handle
+        c.set_line_width(3)
+        c.set_source_rgba(0.2, 0.6, 1.0, 1.0)  # Blue
+        c.move_to(x1, y1)
+        c.line_to(x1, y1 + h1)
+        c.stroke()
+        
+        # Circle with white border at Top-Left
+        c.set_source_rgba(1, 1, 1, 1)  # White border
+        c.arc(x1, y1 - handle_radius, handle_radius + 2, 0, 6.28)
+        c.fill()
+        c.set_source_rgba(0.2, 0.6, 1.0, 1.0)  # Blue fill
+        c.arc(x1, y1 - handle_radius, handle_radius, 0, 6.28)
+        c.fill()
+        
+        # End Handle
+        c.set_source_rgba(0.2, 0.6, 1.0, 1.0)  # Blue
+        c.move_to(x2, y2 - h2)
+        c.line_to(x2, y2)
+        c.stroke()
+        
+        # Circle with white border at Bottom-Right
+        c.set_source_rgba(1, 1, 1, 1)  # White border
+        c.arc(x2, y2 + handle_radius, handle_radius + 2, 0, 6.28)
+        c.fill()
+        c.set_source_rgba(0.2, 0.6, 1.0, 1.0)  # Blue fill
+        c.arc(x2, y2 + handle_radius, handle_radius, 0, 6.28)
+        c.fill()
+        
+        # Also outline the rects slightly?
+        c.set_source_rgba(0.2, 0.6, 1.0, 0.3) # Faint blue
+        for r in ann.rects:
+             c.rectangle(r[0]*self.scale, r[1]*self.scale, r[2]*self.scale, r[3]*self.scale)
+             c.fill()
