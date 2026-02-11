@@ -41,10 +41,100 @@ class AnnotationStore:
     def __init__(self):
         self.annotations: List[Annotation] = []
         self.file_path: Optional[str] = None
+        self._is_dirty: bool = False 
+        self.on_dirty_changed = None # Callback function(is_dirty: bool)
+        
         # Undo/Redo stacks store tuples: (operation, annotation)
-        # operation is 'add' (undoing removes it) or 'remove' (undoing restores it)
         self._undo_stack: List[tuple] = []
         self._redo_stack: List[tuple] = []
+
+    @property
+    def is_dirty(self):
+        return self._is_dirty
+
+    @is_dirty.setter
+    def is_dirty(self, value: bool):
+        print(f"DEBUG: is_dirty changed to {value}")
+        self._is_dirty = value
+        if self.on_dirty_changed:
+            self.on_dirty_changed(value)
+        
+    def get_fingerprint(self, pdf_path: str) -> str:
+        """Generates a simple fingerprint for the PDF file."""
+        import hashlib
+        try:
+            stat = os.stat(pdf_path)
+            with open(pdf_path, 'rb') as f:
+                header = f.read(4096) # Read first 4KB
+            
+            hasher = hashlib.md5()
+            hasher.update(str(stat.st_size).encode('utf-8'))
+            hasher.update(str(stat.st_mtime).encode('utf-8'))
+            hasher.update(header)
+            return hasher.hexdigest()
+        except Exception as e:
+            print(f"Error generating fingerprint: {e}")
+            return "unknown"
+
+    def save_to_file(self, path: str, pdf_path: str):
+        """Saves project to a specific JSON file."""
+        fingerprint = self.get_fingerprint(pdf_path)
+        data = {
+            "format_version": 1,
+            "pdf_fingerprint": fingerprint,
+            "annotations": [asdict(ann) for ann in self.annotations]
+        }
+        
+        try:
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+            print(f"Saved project to {path}")
+            self.is_dirty = False
+        except Exception as e:
+            print(f"Error saving project: {e}")
+            raise e
+
+    def load_from_file(self, path: str, pdf_path: str) -> bool:
+        """Loads project from JSON. Returns False if fingerprint mismatch."""
+        if not os.path.exists(path):
+            return False
+            
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            
+            # version check (future proofing)
+            version = data.get("format_version", 1)
+            
+            # fingerprint check
+            saved_fingerprint = data.get("pdf_fingerprint", "")
+            current_fingerprint = self.get_fingerprint(pdf_path)
+            
+            mismatch = False
+            if saved_fingerprint != current_fingerprint:
+                print(f"WARNING: Fingerprint mismatch! Saved: {saved_fingerprint}, Current: {current_fingerprint}")
+                mismatch = True
+                
+            self.annotations = []
+            for item in data.get('annotations', []):
+                # Backwards compat: If ID missing, generate one
+                if 'id' not in item: item['id'] = str(uuid.uuid4())
+                
+                ann = Annotation(**item)
+                ann.color = tuple(ann.color)
+                ann.rects = [tuple(r) for r in ann.rects]
+                self.annotations.append(ann)
+                
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self.is_dirty = False
+            print(f"Loaded {len(self.annotations)} annotations from {path}")
+            
+            return mismatch # Returns True if there was a mismatch (Warning needed)
+            
+        except Exception as e:
+            print(f"Error loading project: {e}")
+            raise e
         
     def load(self, pdf_path: str):
         """Loads annotations from a sidecar JSON file (pdf_path + .json)."""
@@ -87,14 +177,15 @@ class AnnotationStore:
             with open(self.file_path, 'w') as f:
                 json.dump(data, f, indent=2)
             print(f"Saved annotations to {self.file_path}")
+            self.is_dirty = False # Sidecar save clears dirty too? Requirement: "Set dirty = False after Save"
         except Exception as e:
             print(f"Error saving annotations: {e}")
 
     def add(self, annotation: Annotation):
         self.annotations.append(annotation)
+        self.is_dirty = True
         self._undo_stack.append(('add', annotation))  # Track for undo
         self._redo_stack.clear()  # New action invalidates redo
-        self.save()
         print(f"DEBUG: Added annotation {annotation.id}, undo_stack now has {len(self._undo_stack)} items")
 
     def get_for_page(self, page_index: int) -> List[Annotation]:
@@ -113,14 +204,14 @@ class AnnotationStore:
             self._undo_stack.append(('remove', removed))  # Track as 'remove' operation
             self._redo_stack.clear()  # New action invalidates redo history
             self.annotations = new_list
-            self.save()
+            self.is_dirty = True
             print(f"DEBUG: Removed annotation {removed.id}, undo_stack now has {len(self._undo_stack)} items")
             
     def record_modify(self, annotation_id: str, old_rects: list):
         """Records a modification (rect change) for undo. Stores annotation ID and old rects."""
         self._undo_stack.append(('modify', annotation_id, old_rects))
         self._redo_stack.clear()  # New action invalidates redo
-        self.save()
+        self.is_dirty = True
         print(f"DEBUG: Recorded modify for {annotation_id}, undo_stack now has {len(self._undo_stack)} items")
             
     def undo(self) -> Optional[tuple]:
@@ -139,7 +230,7 @@ class AnnotationStore:
             self.annotations = [a for a in self.annotations if a.id != ann.id]
             print(f"DEBUG: Undid ADD - removed annotation {ann.id}")
             self._redo_stack.append(entry)
-            self.save()
+            self.is_dirty = True
             return (op, ann)
         elif op == 'remove':
             ann = entry[1]
@@ -147,7 +238,7 @@ class AnnotationStore:
             self.annotations.append(ann)
             print(f"DEBUG: Undid REMOVE - restored annotation {ann.id}")
             self._redo_stack.append(entry)
-            self.save()
+            self.is_dirty = True
             return (op, ann)
         elif op == 'modify':
             annotation_id, old_rects = entry[1], entry[2]
@@ -158,7 +249,7 @@ class AnnotationStore:
                     ann.rects = old_rects
                     self._redo_stack.append(('modify', annotation_id, current_rects))
                     print(f"DEBUG: Undid MODIFY - restored {len(old_rects)} rects for {annotation_id}")
-                    self.save()
+                    self.is_dirty = True
                     return (op, ann)
         return None
 
@@ -178,7 +269,7 @@ class AnnotationStore:
             self.annotations.append(ann)
             print(f"DEBUG: Redid ADD - added annotation {ann.id}")
             self._undo_stack.append(entry)
-            self.save()
+            self.is_dirty = True
             return (op, ann)
         elif op == 'remove':
             ann = entry[1]
@@ -186,7 +277,7 @@ class AnnotationStore:
             self.annotations = [a for a in self.annotations if a.id != ann.id]
             print(f"DEBUG: Redid REMOVE - removed annotation {ann.id}")
             self._undo_stack.append(entry)
-            self.save()
+            self.is_dirty = True
             return (op, ann)
         elif op == 'modify':
             annotation_id, new_rects = entry[1], entry[2]
@@ -197,7 +288,7 @@ class AnnotationStore:
                     ann.rects = new_rects
                     self._undo_stack.append(('modify', annotation_id, current_rects))
                     print(f"DEBUG: Redid MODIFY - applied {len(new_rects)} rects for {annotation_id}")
-                    self.save()
+                    self.is_dirty = True
                     return (op, ann)
         return None
 

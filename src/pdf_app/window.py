@@ -13,9 +13,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_title("PDF Workspace")
         self.set_default_size(1200, 800)
         
+        self.connect("close-request", self.on_close_request)
+        
         # --- Core UI Structure ---
         # 1. Tab View (Chrome-like tabs)
         self.tab_view = Adw.TabView()
+        self.tab_view.connect("close-page", self.on_close_page)
         
         # 2. Tab Bar (Top strip for tabs)
         self.tab_bar = Adw.TabBar()
@@ -115,11 +118,21 @@ class MainWindow(Adw.ApplicationWindow):
         
         # File Actions
         action_save = Gio.SimpleAction.new("save", None)
-        action_save.connect("activate", self.on_save)
+        action_save.connect("activate", self.on_save) # Keep Sidecar Sync
         self.add_action(action_save)
         
+        # Save Project As (JSON)
+        action_save_as = Gio.SimpleAction.new("save_project_as", None)
+        action_save_as.connect("activate", self.on_save_project_as)
+        self.add_action(action_save_as)
+        
+        # Open Project (JSON)
+        action_open_project = Gio.SimpleAction.new("open_project", None)
+        action_open_project.connect("activate", self.on_open_project)
+        self.add_action(action_open_project)
+        
         action_export = Gio.SimpleAction.new("export", None)
-        action_export.connect("activate", self.on_export)
+        action_export.connect("activate", self.on_export_pdf)
         self.add_action(action_export)
         
         app.set_accels_for_action("win.save", ["<Ctrl>s"])
@@ -355,10 +368,31 @@ class MainWindow(Adw.ApplicationWindow):
         # 2. Add to tabs
         page = self.tab_view.append(pdf_view)
         page.set_title(file.get_basename())
-        page.set_icon(None) # TODO: Set PDF icon
+        page.set_icon(None)
+        
+        # Connect dirty signal
+        def on_dirty_changed(is_dirty):
+            self.update_tab_status(page, is_dirty)
+            
+        pdf_view.store.on_dirty_changed = on_dirty_changed
         
         # 3. Select it
         self.tab_view.set_selected_page(page)
+
+    def update_tab_status(self, page, is_dirty):
+        """Updates tab title with dirty indicator."""
+        title = page.get_title()
+        if not title: return
+        
+        # Suffix style: "Filename.pdf *"
+        clean_title = title
+        if title.endswith(" *"):
+            clean_title = title[:-2]
+            
+        if is_dirty:
+            page.set_title(f"{clean_title} *")
+        else:
+            page.set_title(clean_title)
 
     def on_zoom_in(self, action, param):
         """Zoom in on current PDF."""
@@ -394,8 +428,256 @@ class MainWindow(Adw.ApplicationWindow):
             view.store.save()
             print(f"DEBUG: Saved annotations for {view.file.get_basename()}")
 
-    def on_export(self, action, param):
-        """Export to PDF (Placeholder)."""
-        # TODO: Implement PDF Export
-        print("DEBUG: Export to PDF triggered")
+    def on_export_pdf(self, action, param):
+        """Export to Flattened PDF."""
+        selected_page = self.tab_view.get_selected_page()
+        if not selected_page: return
+        page = selected_page
+        view = page.get_child()
+        if not hasattr(view, 'store'): return
+        
+        dialog = Gtk.FileChooserNative(
+            title="Export PDF",
+            transient_for=self,
+            action=Gtk.FileChooserAction.SAVE
+        )
+        
+        filter_pdf = Gtk.FileFilter()
+        filter_pdf.set_name("PDF Documents")
+        filter_pdf.add_mime_type("application/pdf")
+        dialog.add_filter(filter_pdf)
+        
+        # Suggest filename: original_flattened.pdf
+        try:
+            orig_name = view.file.get_basename()
+            suggested = orig_name.replace(".pdf", "") + "_flattened.pdf"
+            dialog.set_current_name(suggested)
+        except: pass
+        
+        def on_response(d, response):
+            if response == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                path = file.get_path()
+                
+                from pdf_app.document.export import export_flattened_pdf
+                success = export_flattened_pdf(view.file.get_path(), view.store, path)
+                
+                if success:
+                    print(f"Exported to {path}")
+                    toast = Adw.Toast.new(f"Exported to {file.get_basename()}")
+                    self.toolbar_view.add_toast(toast)
+                else:
+                    toast = Adw.Toast.new("Export Failed")
+                    self.toolbar_view.add_toast(toast)
+            d.destroy()
+            
+        dialog.connect("response", on_response)
+        dialog.show()
+
+    def on_save_project_as(self, action, param):
+        """Save Project As (JSON)."""
+        selected_page = self.tab_view.get_selected_page()
+        if not selected_page: return
+        view = selected_page.get_child()
+        if not hasattr(view, 'store'): return
+        
+        dialog = Gtk.FileChooserNative(
+            title="Save Project As",
+            transient_for=self,
+            action=Gtk.FileChooserAction.SAVE
+        )
+        
+        filter_json = Gtk.FileFilter()
+        filter_json.set_name("Project Files (*.json)")
+        filter_json.add_pattern("*.json")
+        dialog.add_filter(filter_json)
+        
+        try:
+            orig_name = view.file.get_basename()
+            suggested = orig_name + ".json"
+            dialog.set_current_name(suggested)
+        except: pass
+        
+        def on_response(d, response):
+            if response == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                path = file.get_path()
+                try:
+                    view.store.save_to_file(path, view.file.get_path())
+                    toast = Adw.Toast.new(f"Project saved to {file.get_basename()}")
+                    self.toolbar_view.add_toast(toast)
+                except Exception as e:
+                    print(f"Error: {e}")
+                    toast = Adw.Toast.new("Save Failed")
+                    self.toolbar_view.add_toast(toast)
+            d.destroy()
+            
+        dialog.connect("response", on_response)
+        dialog.show()
+
+    def on_open_project(self, action, param):
+        """Open Project (JSON) into current PDF tab."""
+        selected_page = self.tab_view.get_selected_page()
+        if not selected_page: return
+        view = selected_page.get_child()
+        if not hasattr(view, 'store'): return
+        
+        dialog = Gtk.FileChooserNative(
+            title="Open Project",
+            transient_for=self,
+            action=Gtk.FileChooserAction.OPEN
+        )
+        
+        filter_json = Gtk.FileFilter()
+        filter_json.set_name("Project Files (*.json)")
+        filter_json.add_pattern("*.json")
+        dialog.add_filter(filter_json)
+        
+        def on_response(d, response):
+            if response == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                path = file.get_path()
+                try:
+                    mismatch = view.store.load_from_file(path, view.file.get_path())
+                    if mismatch:
+                        toast = Adw.Toast.new("Warning: PDF Mismatch")
+                        self.toolbar_view.add_toast(toast)
+                    else:
+                        toast = Adw.Toast.new("Project Loaded")
+                        self.toolbar_view.add_toast(toast)
+                        
+                    view.reload_page(view.page_number)
+                    
+                except Exception as e:
+                    print(f"Error: {e}")
+                    toast = Adw.Toast.new("Load Failed")
+                    self.toolbar_view.add_toast(toast)
+            d.destroy()
+            
+        dialog.connect("response", on_response)
+        dialog.show()
+        
+    def on_close_page(self, tab_view, page):
+        """Handle single tab close request."""
+        view = page.get_child()
+        if hasattr(view, 'store') and getattr(view.store, 'is_dirty', False):
+            # Show prompt for this single page
+            self.prompt_save_changes([page], close_app=False)
+            return True # Stop close
+        return False # Allow close
+
+    def on_close_request(self, win):
+        """Handle window close request - Check dirty state."""
+        dirty_pages = []
+        n = self.tab_view.get_n_pages()
+        for i in range(n):
+            page_wrapper = self.tab_view.get_nth_page(i)
+            view = page_wrapper.get_child()
+            if hasattr(view, 'store') and getattr(view.store, 'is_dirty', False):
+                dirty_pages.append(page_wrapper)
+        
+        if not dirty_pages:
+            return False 
+        
+        self.prompt_save_changes(dirty_pages, close_app=True)
+        return True 
+
+    def prompt_save_changes(self, dirty_pages, close_app=True):
+        count = len(dirty_pages)
+        
+        if count == 1:
+            page = dirty_pages[0]
+            title = page.get_title()
+            if title.endswith(" *"): title = title[:-2]
+            
+            msg = f"Save changes to '{title}' before closing?"
+            heading = "Save Changes?"
+        else:
+            heading = "Unsaved Changes"
+            msg = "The following documents have unsaved changes:"
+
+        alert = Adw.MessageDialog(
+            transient_for=self,
+            heading=heading,
+            body=msg
+        )
+        
+        # For multiple files, use extra child for left-aligned list
+        if count > 1:
+            filenames = []
+            for page in dirty_pages:
+                t = page.get_title()
+                if t.endswith(" *"): t = t[:-2]
+                filenames.append(t)
+            
+            # Use a box with a label to ensure left alignment
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.set_margin_top(10)
+            box.set_margin_bottom(10)
+            
+            # Simple label with newlines
+            list_text = "\n".join([f"• {name}" for name in filenames])
+            lbl = Gtk.Label(label=list_text)
+            lbl.set_xalign(0) # Left align
+            lbl.add_css_class("body")
+            
+            box.append(lbl)
+            alert.set_extra_child(box)
+        
+        alert.add_response("cancel", "Cancel")
+        
+        if count > 1:
+            alert.add_response("discard", "Discard & Quit")
+            alert.add_response("save", "Save All & Quit")
+        else:
+            alert.add_response("discard", "Discard")
+            alert.add_response("save", "Save")
+            
+        alert.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        
+        def on_response(dlg, resp):
+            if resp == "discard":
+                if close_app:
+                    try: self.disconnect_by_func(self.on_close_request)
+                    except: pass
+                    self.close()
+                else:
+                    page = dirty_pages[0] 
+                    self.tab_view.close_page_finish(page, True)
+                    
+            elif resp == "save":
+                for page in dirty_pages:
+                    view = page.get_child()
+                    if hasattr(view, 'store'):
+                        try:
+                            view.store.save()
+                        except Exception as e:
+                            print(f"Error saving {page.get_title()}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                
+                if close_app:
+                    try: self.disconnect_by_func(self.on_close_request)
+                    except: pass
+                    self.close()
+                else:
+                    page = dirty_pages[0]
+                    self.tab_view.close_page_finish(page, True)
+            
+            else: # Cancel
+                 if not close_app:
+                    # Explicitly reject the close request so AdwTabView resets state
+                    page = dirty_pages[0]
+                    self.tab_view.close_page_finish(page, False)
+                    # Force update status to ensure * remains visible if needed
+                    view = page.get_child()
+                    if hasattr(view, 'store'):
+                        # toggle to force update? No, just call update
+                        self.update_tab_status(page, view.store.is_dirty)
+            
+            dlg.close()
+                
+        alert.connect("response", on_response)
+        alert.present()
 

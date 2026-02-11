@@ -29,12 +29,18 @@ class PDFView(Gtk.ScrolledWindow):
         self.set_hexpand(True)
         
         # Container for pages (vertical stack)
+        # Container for pages (vertical stack)
         self.page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.page_box.set_halign(Gtk.Align.CENTER)
         self.page_box.set_margin_top(20)
         self.page_box.set_margin_bottom(20)
         
-        self.set_child(self.page_box)
+        # Explicit Viewport to disable auto-scroll on focus
+        self.viewport = Gtk.Viewport()
+        self.viewport.set_scroll_to_focus(False) # FIX: Prevents jumping to top on click
+        self.viewport.set_child(self.page_box)
+        
+        self.set_child(self.viewport)
         self.pages = [] # Track page instances
         
         # Pinch-to-Zoom Gesture

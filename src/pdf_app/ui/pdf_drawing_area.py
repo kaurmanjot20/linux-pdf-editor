@@ -163,6 +163,11 @@ class PDFDrawingArea(Gtk.DrawingArea):
         
         # HANDLE MOVE
         if self._resizing_handle == 'move':
+            # Threshold check
+            drag_dist = (offset_x**2 + offset_y**2)**0.5
+            if drag_dist < 5.0: 
+                 return
+
             # Calculate delta in pdf coords
             dx = offset_x / self.scale
             dy = offset_y / self.scale
@@ -221,7 +226,6 @@ class PDFDrawingArea(Gtk.DrawingArea):
             print(f"DEBUG: Finished resizing {self._resizing_handle} handle")
             # Record the modification for undo (stores old rects)
             self.store.record_modify(self.selected_annotation.id, self._old_rects)
-            self.store.save()
             
         self._resizing_handle = None
         self._resize_start_pos = None
