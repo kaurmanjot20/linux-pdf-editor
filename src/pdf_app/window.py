@@ -5,6 +5,7 @@ from gi.repository import Gtk, Adw, Gio, GLib
 
 from pdf_app.ui.pdf_view import PDFView
 from pdf_app.ui.empty_view import EmptyView
+from pdf_app.ui.thumbnail_sidebar import ThumbnailSidebar
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, *args, **kwargs):
@@ -14,44 +15,99 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_default_size(1200, 800)
         
         self.connect("close-request", self.on_close_request)
-        
-        # --- Core UI Structure ---
-        # 1. Tab View (Chrome-like tabs)
-        self.tab_view = Adw.TabView()
-        self.tab_view.connect("close-page", self.on_close_page)
-        
-        # 2. Tab Bar (Top strip for tabs)
-        self.tab_bar = Adw.TabBar()
-        self.tab_bar.set_view(self.tab_view)
-        self.tab_bar.set_autohide(False) 
-        
-        # 3. Main layout container
-        # We use a ToolbarView (Libadwaita 1.4+) or just a box + headerbar approach
-        # AdwToolbarView is cleaner for modern apps
+        # --- UI Structure ---
+        # 1. ToolbarView (Handles Top/Bottom Bars)
         self.toolbar_view = Adw.ToolbarView()
         self.set_content(self.toolbar_view)
         
-        # Top bar with tabs
+        # 2. Header Bar
         self.header_bar = Adw.HeaderBar()
         self.toolbar_view.add_top_bar(self.header_bar)
         
-        # The tab bar usually goes below the header bar or *in* the header bar for simple apps.
-        # For a Chrome-like experience, we want tabs to be prominent. 
-        # Making the tab bar the primary navigation.
-        self.toolbar_view.add_top_bar(self.tab_bar)
+        # Header Controls (Center)
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         
-        # Content area
-        self.toolbar_view.set_content(self.tab_view)
+        self.page_label = Gtk.Label(label="Page 0 / 0")
+        self.page_label.set_css_classes(["numeric"])
         
-        # Content area
-        self.toolbar_view.set_content(self.tab_view)
+        self.zoom_label = Gtk.Label(label="100%")
+        self.zoom_label.set_css_classes(["numeric"])
         
-        # --- Ribbon UI ---
+        title_box.append(self.page_label)
+        title_box.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        title_box.append(self.zoom_label)
+        
+        # View Controls
+        view_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        view_box.set_css_classes(["linked"])
+        
+        btn_sidebar = Gtk.ToggleButton(icon_name="sidebar-show-symbolic")
+        btn_sidebar.set_tooltip_text("Toggle Sidebar")
+        btn_sidebar.set_action_name("win.toggle_sidebar")
+        view_box.append(btn_sidebar)
+        
+        btn_dual = Gtk.ToggleButton(icon_name="view-grid-symbolic")
+        btn_dual.set_tooltip_text("Dual Page View")
+        btn_dual.set_action_name("win.view_dual")
+        view_box.append(btn_dual)
+        
+        btn_cont = Gtk.ToggleButton(icon_name="view-continuous-symbolic") # or view-paged-symbolic
+        btn_cont.set_tooltip_text("Continuous Scroll")
+        btn_cont.set_action_name("win.view_continuous")
+        view_box.append(btn_cont)
+        
+        # Add to Header (End)
+        self.header_bar.pack_end(view_box)
+        
+        self.header_bar.set_title_widget(title_box)
+        
+        # 3. Ribbon (Top Bar)
         self.active_tool_name = None
         self.ribbon_box = self.build_ribbon()
         self.toolbar_view.add_top_bar(self.ribbon_box)
 
-        # --- Actions ---
+        
+        # 4. Tab Bar (Below Ribbon)
+        self.tab_bar = Adw.TabBar()
+        self.toolbar_view.add_top_bar(self.tab_bar)
+        
+        # 5. Overlay Split View (Sidebar | Content)
+        self.split_view = Adw.OverlaySplitView()
+        self.split_view.set_vexpand(True)
+        self.split_view.set_sidebar_width_fraction(0.15)
+        self.split_view.set_min_sidebar_width(150)
+        self.split_view.set_max_sidebar_width(400)
+        self.split_view.set_enable_show_gesture(True)
+        self.split_view.set_enable_hide_gesture(True)
+        self.split_view.set_show_sidebar(False) # Default hidden
+        
+        self.toolbar_view.set_content(self.split_view)
+        
+        # 6. Sidebar (Dynamic per tab)
+        # self.sidebar = ThumbnailSidebar() # REMOVED global
+        # self.sidebar.connect('page-selected', self.on_sidebar_page_selected)
+        # self.split_view.set_sidebar(self.sidebar)
+        
+        # We will create one for each tab and swap it in.
+        # Placeholder for empty tabs/docs
+        self.sidebar_placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        lbl = Gtk.Label(label="No Pages")
+        lbl.set_vexpand(True)
+        lbl.set_valign(Gtk.Align.CENTER)
+        self.sidebar_placeholder.append(lbl)
+        self.sidebar_placeholder.set_size_request(200, -1) # Match sidebar width
+        
+        self.split_view.set_sidebar(self.sidebar_placeholder)
+        
+        # 7. Tab View (Content)
+        self.tab_view = Adw.TabView()
+        self.tab_view.connect('notify::selected-page', self.on_tab_changed)
+        self.tab_view.connect("close-page", self.on_close_page)
+        self.tab_bar.set_view(self.tab_view)
+        
+        self.split_view.set_content(self.tab_view)
+        
+        # Actions
         self.setup_actions()
         
         # Add an initial empty tab or welcome screen
@@ -142,6 +198,32 @@ class MainWindow(Adw.ApplicationWindow):
         action_deselect = Gio.SimpleAction.new("deselect", None)
         action_deselect.connect("activate", self.on_deselect)
         self.add_action(action_deselect)
+
+        # Toggle Sidebar Action
+        action_toggle_sidebar = Gio.SimpleAction.new_stateful(
+            "toggle_sidebar",
+            None,
+            GLib.Variant.new_boolean(False) # Default Hidden
+        )
+        action_toggle_sidebar.connect("change-state", self.on_toggle_sidebar)
+        self.add_action(action_toggle_sidebar)
+        self.action_toggle_sidebar = action_toggle_sidebar
+        
+        if app:
+            app.set_accels_for_action("win.toggle_sidebar", ["<Ctrl><Alt>m"])
+
+        # View Mode Actions
+        action_view_dual = Gio.SimpleAction.new_stateful(
+            "view_dual", None, GLib.Variant.new_boolean(False)
+        )
+        action_view_dual.connect("change-state", self.on_view_dual_toggled)
+        self.add_action(action_view_dual)
+        
+        action_view_continuous = Gio.SimpleAction.new_stateful(
+            "view_continuous", None, GLib.Variant.new_boolean(True)
+        )
+        action_view_continuous.connect("change-state", self.on_view_continuous_toggled)
+        self.add_action(action_view_continuous)
 
     def on_deselect(self, action, param):
         """Handle Escape key globally."""
@@ -290,13 +372,21 @@ class MainWindow(Adw.ApplicationWindow):
     def activate_tool(self, tool_name):
         self.active_tool_name = tool_name
         # Propagate to ALL tabs (Global Tool State)
-        n = self.tab_view.get_n_pages()
-        for i in range(n):
+        # 2. Clear Selection & Close Popovers
+        for i in range(self.tab_view.get_n_pages()):
             page_wrapper = self.tab_view.get_nth_page(i)
             view = page_wrapper.get_child()
+            if hasattr(view, 'drawing_area') and view.drawing_area.selected_annotation:
+                 view.drawing_area.selected_annotation = None
+                 view.drawing_area.queue_draw()
+            if hasattr(view, 'editor_popover') and view.editor_popover:
+                 view.editor_popover.popdown()
             if hasattr(view, 'set_tool'):
                 view.set_tool(tool_name)
 
+    def grab_focus_on_click(self, gesture, n_press, x, y):
+        self.grab_focus()
+        
     def update_ribbon_tool_state(self, tool_name):
         """Update ribbon buttons based on tool name (Sync UI)."""
         # Block signals to prevent recursion
@@ -557,6 +647,137 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.connect("response", on_response)
         dialog.show()
         
+    def on_sidebar_page_selected(self, sidebar, page_index):
+        """Called when sidebar thumbnail is clicked."""
+        page = self.tab_view.get_selected_page()
+        if page:
+            view = page.get_child()
+            if isinstance(view, PDFView):
+                # Scroll to page
+                view.scroll_to_page(page_index)
+                view.grab_focus() # Return focus to PDF for keyboard nav
+
+    # Old duplicate on_tab_changed removed
+    # The actual implementation is further down (around line 680 originally)
+    # Checking lines 653-670 shows a partial method that looks like a duplicate or old version.
+    # Based on previous file reads, there were two on_tab_changed methods?
+    # No, I see one at 648 and another at 673 in the previous `view_file` output!
+    # I must remove the first erratic one.
+
+    def on_toggle_sidebar(self, action, param):
+        """Toggle sidebar visibility."""
+        show = not self.split_view.get_show_sidebar()
+        self.split_view.set_show_sidebar(show)
+        action.set_state(GLib.Variant.new_boolean(show))
+
+    def on_tab_changed(self, tab_view, param):
+        """Called when active tab changes."""
+        page = self.tab_view.get_selected_page()
+        
+        # Disconnect old signals and SAVE STATE
+        if hasattr(self, 'current_view_signals') and self.current_view_signals:
+            old_view, handler_ids = self.current_view_signals
+            
+            # Save sidebar visibility to old view
+            old_view.sidebar_visible = self.split_view.get_show_sidebar()
+            
+            for hid in handler_ids:
+                try:
+                    if old_view.handler_is_connected(hid):
+                        old_view.disconnect(hid)
+                except:
+                    pass
+            self.current_view_signals = None
+
+        if not page:
+            # Clear sidebar and HIDE it
+            self.split_view.set_sidebar(self.sidebar_placeholder)
+            self.split_view.set_show_sidebar(False)
+            
+            # Disable Sidebar Toggle
+            self.action_toggle_sidebar.set_enabled(False)
+                 
+            self.page_label.set_text("No Document")
+            self.zoom_label.set_text("")
+            return
+            
+        view = page.get_child()
+        if isinstance(view, PDFView):
+            # Enable Sidebar Toggle
+            self.action_toggle_sidebar.set_enabled(True)
+            # 1. Swap Sidebar
+            if not view.sidebar:
+                # Create if missing (lazy load)
+                view.sidebar = ThumbnailSidebar()
+                view.sidebar.load_document(view.document)
+                view.sidebar.connect('page-selected', self.on_sidebar_page_selected)
+                
+            self.split_view.set_sidebar(view.sidebar)
+            
+            # Restore Sidebar Visibility
+            was_visible = getattr(view, 'sidebar_visible', False) # Default closed?
+            self.split_view.set_show_sidebar(was_visible)
+            
+            # 2. Sync Tool State
+            # Get current tool from view (assuming 'tool_mode' attr or defaulting to 'select')
+            current_tool = getattr(view, 'tool_mode', 'select') # Default to select if missing
+            self.update_ribbon_tool_state(current_tool)
+            
+            # Connect Signals
+            h1 = view.connect('page-changed', self.on_view_page_changed)
+            h2 = view.connect('zoom-changed', self.on_view_zoom_changed)
+            self.current_view_signals = (view, [h1, h2])
+            
+            self.update_header_info(view)
+            self.update_header_info(view)
+        else:
+            self.split_view.set_sidebar(self.sidebar_placeholder)
+            self.split_view.set_show_sidebar(False) # HIDE IT
+            self.action_toggle_sidebar.set_enabled(False) # DISABLE TOGGLE
+            
+            self.page_label.set_text("Empty")
+            self.zoom_label.set_text("")
+
+    def on_view_page_changed(self, view, page_index):
+        # Only update if view is active
+        active_page = self.tab_view.get_selected_page()
+        if active_page and active_page.get_child() == view:
+            if view.sidebar:
+                 view.sidebar.select_page(page_index)
+            self.update_header_info(view)
+
+    def on_view_zoom_changed(self, view, scale):
+        active_page = self.tab_view.get_selected_page()
+        if active_page and active_page.get_child() == view:
+            self.update_header_info(view)
+            
+    def update_header_info(self, view):
+        n_pages = len(view.pages)
+        self.page_label.set_text(f"Page {view.current_page_index + 1} / {n_pages}")
+        self.zoom_label.set_text(f"{int(view.scale * 100)}%")
+
+    def on_view_dual_toggled(self, action, value):
+        action.set_state(value)
+        enabled = value.get_boolean()
+        page = self.tab_view.get_selected_page()
+        if page:
+            view = page.get_child()
+            if isinstance(view, PDFView):
+                view.set_dual_page_mode(enabled)
+                if view.sidebar:
+                    view.sidebar.set_dual_mode(enabled)
+                self.update_header_info(view)
+
+    def on_view_continuous_toggled(self, action, value):
+        action.set_state(value)
+        enabled = value.get_boolean()
+        page = self.tab_view.get_selected_page()
+        if page:
+            view = page.get_child()
+            if isinstance(view, PDFView):
+                view.set_continuous_scroll(enabled)
+                self.update_header_info(view)
+                
     def on_close_page(self, tab_view, page):
         """Handle single tab close request."""
         view = page.get_child()
@@ -565,7 +786,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.prompt_save_changes([page], close_app=False)
             return True # Stop close
         return False # Allow close
-
+                
     def on_close_request(self, win):
         """Handle window close request - Check dirty state."""
         dirty_pages = []
@@ -581,6 +802,8 @@ class MainWindow(Adw.ApplicationWindow):
         
         self.prompt_save_changes(dirty_pages, close_app=True)
         return True 
+
+ 
 
     def prompt_save_changes(self, dirty_pages, close_app=True):
         count = len(dirty_pages)

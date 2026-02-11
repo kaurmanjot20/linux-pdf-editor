@@ -29,8 +29,8 @@ class PDFPageView(Gtk.Overlay):
         
         # 1. Background (PDF Render)
         self.drawing_area = PDFDrawingArea(page, self.scale, store)
-        self.drawing_area.set_hexpand(True)
-        self.drawing_area.set_vexpand(True)
+        # self.drawing_area.set_hexpand(True) # REMOVED: Fix zoom/fit issues
+        # self.drawing_area.set_vexpand(True)
         self.set_child(self.drawing_area)
         
         
